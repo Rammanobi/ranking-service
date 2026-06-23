@@ -7,3 +7,4 @@ backend/data.db-shm
 backend/.pytest_cache/
 backend/server.log
 .DS_Store
+frontend/frontend.log

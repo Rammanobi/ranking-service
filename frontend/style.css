@@ -30,6 +30,13 @@ header {
 
 header h1 { margin: 0; font-size: 1.25rem; }
 
+nav a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 0.85rem;
+}
+nav a:hover { text-decoration: underline; }
+
 .api-base-row {
   display: flex;
   align-items: center;
@@ -59,6 +66,8 @@ header h1 { margin: 0; font-size: 1.25rem; }
 
 main {
   padding: 1.5rem;
+  max-width: 960px;
+  margin: 0 auto;
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 1rem;

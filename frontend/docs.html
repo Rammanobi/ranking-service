@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Ranking Service — Docs</title>
+<link rel="stylesheet" href="style.css" />
+<link rel="stylesheet" href="docs.css" />
+</head>
+<body>
+  <header>
+    <h1>Ranking Service</h1>
+    <nav>
+      <a href="index.html">App</a>
+    </nav>
+  </header>
+
+  <div class="docs-body">
+    <nav class="toc">
+      <a href="#overview">Overview</a>
+      <a href="#structure">Project structure</a>
+      <a href="#run">Run locally</a>
+      <a href="#deploy">Live deployment</a>
+      <a href="#api-transaction">POST /transaction</a>
+      <a href="#api-summary">GET /summary/:userId</a>
+      <a href="#api-ranking">GET /ranking</a>
+      <a href="#ranking-calc">How ranking is calculated</a>
+      <a href="#abuse">Duplicates & abuse prevention</a>
+      <a href="#assumptions">Assumptions & trade-offs</a>
+    </nav>
+
+    <article class="doc">
+      <h2 id="overview">Overview</h2>
+      <p>
+        A small backend + frontend that records user "transactions" (point-earning
+        events), exposes a per-user summary, and ranks users on a leaderboard using
+        more than one factor — built to demonstrate API design, data consistency,
+        duplicate-request handling, concurrency safety, and abuse-resistant ranking.
+      </p>
+
+      <h2 id="structure">Project structure</h2>
+      <pre class="tree"><code>ranking-service/
+├── backend/            FastAPI service (Python)
+│   ├── app/
+│   │   ├── main.py         API routes, error handling
+│   │   ├── repository.py   transaction insert + aggregate update (atomic)
+│   │   ├── ranking.py      ranking score formula
+│   │   ├── rate_limiter.py per-user sliding-window rate limit
+│   │   ├── db.py           SQLite connection, schema, locking
+│   │   ├── models.py       request/response validation (Pydantic)
+│   │   └── config.py       all tunable constants in one place
+│   ├── tests/test_api.py   pytest suite (incl. a concurrency race test)
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── render.yaml         deploy config for Render
+└── frontend/            Static vanilla HTML/CSS/JS client
+    ├── index.html
+    ├── docs.html        this page
+    ├── style.css
+    └── app.js</code></pre>
+
+      <h2 id="run">How to run it locally</h2>
+      <h3>Backend</h3>
+      <pre><code>cd ranking-service/backend
+python -m venv .venv
+source .venv/Scripts/activate      # Windows Git Bash
+# .venv\Scripts\Activate.ps1       # Windows PowerShell
+# source .venv/bin/activate        # macOS / Linux
+
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000</code></pre>
+      <p>
+        The API is now at <code>http://localhost:8000</code> (interactive docs at
+        <code>/docs</code>). A SQLite file <code>backend/data.db</code> is created
+        automatically on first run.
+      </p>
+
+      <h3>Tests</h3>
+      <pre><code>cd ranking-service/backend
+python -m pytest tests/ -v</code></pre>
+
+      <h3>Frontend</h3>
+      <p>
+        Plain static files, no build step. Open <code>frontend/index.html</code>
+        directly, or serve it:
+      </p>
+      <pre><code>cd ranking-service/frontend
+python -m http.server 5500</code></pre>
+      <p>
+        Type the backend URL into the "API" field at the top of the app
+        (defaults to <code>http://localhost:8000</code>) and click Save. A green
+        dot means the API is reachable.
+      </p>
+
+      <h2 id="deploy">Live deployment</h2>
+      <p><strong>Backend → Render:</strong> push to GitHub, then in Render use
+        New → Blueprint, pointing at this repo — it picks up
+        <code>backend/render.yaml</code> automatically. Render's free disk is
+        ephemeral, so attach a persistent disk (or swap SQLite for Postgres) if
+        you need data to survive restarts.</p>
+      <p><strong>Frontend → GitHub Pages / Netlify / Vercel:</strong> deploy the
+        <code>frontend/</code> folder as-is — it's static HTML/CSS/JS, zero
+        config. CORS is wide open in <code>main.py</code> specifically so the
+        frontend can live on a different domain than the API.</p>
+
+      <h2 id="api-transaction">POST /transaction</h2>
+      <p>Records a point-earning event for a user.</p>
+      <pre><code>{ "user_id": "alice", "amount": 50, "idempotency_key": "alice-2026-06-23-001" }</code></pre>
+      <ul>
+        <li><code>user_id</code> — 1–64 chars, letters/digits/<code>-</code>/<code>_</code> only.</li>
+        <li><code>amount</code> — number, <code>0.01 ≤ amount ≤ 100000</code>. Rejected if
+          missing, negative, zero, NaN/Infinity, or out of range.</li>
+        <li><code>idempotency_key</code> — client-supplied string (1–128 chars)
+          identifying this transaction attempt; reuse it on retries.</li>
+      </ul>
+      <p>Responses: <code>201</code> first time seen · <code>200</code> with
+        <code>duplicate: true</code> if the key was already processed ·
+        <code>422</code> on validation failure · <code>429</code> if rate-limited.</p>
+
+      <h2 id="api-summary">GET /summary/:userId</h2>
+      <pre><code>{
+  "user_id": "alice",
+  "total_points": 120.0,
+  "transaction_count": 3,
+  "active_days": 2,
+  "ranking_points": 87.0,
+  "rank": 4
+}</code></pre>
+      <p><code>total_points</code> is the raw sum of all transactions.
+        <code>ranking_points</code> is the score actually used for the
+        leaderboard — not the same value by design (see below).
+        Returns <code>404</code> if the user has no transactions yet.</p>
+
+      <h2 id="api-ranking">GET /ranking</h2>
+      <p>Leaderboard ordered by <code>ranking_points</code> descending (ties
+        broken by <code>total_points</code>, then <code>user_id</code>).
+        Supports <code>?limit=</code> (default 100, max 500) and
+        <code>?offset=</code> for pagination.</p>
+      <pre><code>[
+  {"rank": 1, "user_id": "bob", "total_points": 300.0, "active_days": 1, "ranking_points": 213.0},
+  {"rank": 2, "user_id": "alice", "total_points": 120.0, "active_days": 1, "ranking_points": 87.0}
+]</code></pre>
+
+      <h2 id="ranking-calc">How ranking is calculated</h2>
+      <p>A pure sum of points is easy to game — one oversized transaction can
+        take #1 with zero sustained engagement. So the score combines two
+        factors:</p>
+      <pre><code>ranking_points = 0.7 * capped_points + 0.3 * (active_days * 10)</code></pre>
+      <ul>
+        <li><strong>capped_points</strong> — sum of the user's transaction
+          amounts, but each individual transaction can contribute at most
+          5,000 points toward this sum (<code>MAX_RANKING_CONTRIBUTION_PER_TRANSACTION</code>
+          in <code>config.py</code>). The raw, uncapped total is still shown
+          as <code>total_points</code>.</li>
+        <li><strong>active_days</strong> — number of distinct calendar days the
+          user has at least one transaction on. Rewards consistent activity
+          over a one-off spike.</li>
+      </ul>
+      <p>Weights and the per-day bonus live in <code>config.py</code> as named
+        constants — fully auditable and tunable, not a black box.</p>
+
+      <h2 id="abuse">How duplicates and abuse are prevented</h2>
+      <h3>Duplicate processing (idempotency)</h3>
+      <ul>
+        <li>Every <code>POST /transaction</code> requires a caller-supplied
+          <code>idempotency_key</code>.</li>
+        <li><code>transactions.idempotency_key</code> has a <code>UNIQUE</code>
+          constraint in SQLite.</li>
+        <li>On insert, the code checks for an existing row with that key first;
+          if found, it returns the <em>original</em> transaction with
+          <code>duplicate: true</code> instead of inserting again.</li>
+        <li>Race safety: the whole check-then-insert sequence is wrapped in a
+          process-wide lock, and the database's own <code>UNIQUE</code>
+          constraint is the fallback if two identical requests somehow race
+          past that — caught and converted to the same idempotent response.</li>
+      </ul>
+      <h3>Consistent aggregate updates</h3>
+      <p>A transaction insert and the corresponding summary/ranking updates
+        happen inside one SQLite transaction — both land or neither does.</p>
+      <h3>Abuse prevention beyond dedup</h3>
+      <ul>
+        <li><strong>Rate limiting</strong> — max 10 transactions per user per
+          60-second sliding window, independent of idempotency keys.</li>
+        <li><strong>Per-transaction ranking cap</strong> — stops one inflated
+          transaction from buying the top rank.</li>
+        <li><strong>Strict input validation</strong> — restricted character
+          sets, bounded amounts, explicit NaN/Infinity rejection.</li>
+      </ul>
+
+      <h2 id="assumptions">Assumptions & trade-offs</h2>
+      <ul>
+        <li><strong>SQLite, single process</strong> — zero external setup,
+          real ACID transactions. Multi-instance deployment would need the
+          write lock and rate limiter moved to shared state (e.g. Redis).</li>
+        <li><strong>No authentication</strong> — <code>user_id</code> is taken
+          at face value from the request body; a real system would derive it
+          from an authenticated session.</li>
+        <li><strong>Rate limiter is in-memory</strong> — resets on restart,
+          not shared across instances.</li>
+        <li><strong>Transactions are always positive</strong> — no
+          refund/penalty modeling.</li>
+        <li><strong>Ranking weights are static constants</strong>, not
+          learned/adaptive — simpler and fully auditable.</li>
+      </ul>
+    </article>
+  </div>
+
+  <script src="docs.js"></script>
+</body>
+</html>
