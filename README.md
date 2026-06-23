@@ -26,7 +26,71 @@ ranking-service/
     └── app.js
 ```
 
-## 1. How to run it locally
+## 1. Architecture & data flow
+
+**Components**
+
+```mermaid
+flowchart TD
+    FE["Frontend<br/>index.html / app.js"] -->|"HTTP fetch (JSON)"| API["FastAPI app<br/>main.py"]
+
+    API --> VAL["Validation<br/>models.py (Pydantic)"]
+    API --> RL["Rate limiter<br/>rate_limiter.py"]
+    API --> REPO["Repository<br/>repository.py"]
+
+    REPO --> LOCK["Process write lock<br/>db.WRITE_LOCK"]
+    REPO --> RANK["Ranking formula<br/>ranking.py"]
+    REPO -->|"BEGIN IMMEDIATE … COMMIT"| DB[("SQLite<br/>data.db")]
+
+    DB --> T["transactions<br/>(idempotency_key UNIQUE)"]
+    DB --> S["user_summary<br/>(aggregates + rank)"]
+    DB --> AD["user_active_dates<br/>(consistency tracking)"]
+```
+
+**Request flow for `POST /transaction`** — this is where validation, rate
+limiting, idempotency, and atomic consistency all happen, in order:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant API as FastAPI (main.py)
+    participant RL as rate_limiter.py
+    participant R as repository.py
+    participant DB as SQLite (transaction)
+
+    C->>API: POST /transaction {user_id, amount, idempotency_key}
+    API->>API: Pydantic validation (amount bounds, charset)
+    API->>RL: check_and_record(user_id)
+    alt over 10 req/60s
+        RL-->>API: blocked
+        API-->>C: 429 Too Many Requests
+    else allowed
+        RL-->>API: ok
+        API->>R: insert_transaction(...)
+        R->>R: acquire WRITE_LOCK
+        R->>DB: SELECT by idempotency_key
+        alt key already exists
+            DB-->>R: existing row
+            R-->>API: DuplicateTransactionError
+            API-->>C: 200 OK {duplicate: true}
+        else new key
+            R->>DB: BEGIN IMMEDIATE
+            R->>DB: INSERT transactions
+            R->>DB: UPSERT user_active_dates, user_summary
+            R->>DB: UPDATE ranking_points (ranking.py formula)
+            R->>DB: COMMIT
+            R-->>API: new row
+            API-->>C: 201 Created {duplicate: false}
+        end
+        R->>R: release WRITE_LOCK
+    end
+```
+
+`GET /summary/:userId` and `GET /ranking` are plain reads straight off
+`user_summary` — no lock needed, since SQLite's WAL mode lets reads proceed
+without blocking on the writer.
+
+## 2. How to run it locally
 
 **Backend**
 
@@ -62,7 +126,7 @@ On load, type the backend URL into the "API base URL" field at the top
 (defaults to `http://localhost:8000`) and click **Save**. A green dot means
 the API is reachable.
 
-## 2. Live deployment
+## 3. Live deployment
 
 This repo is deploy-ready but was not deployed from this environment (no
 hosting credentials available here). Two free options that work with the
@@ -86,7 +150,7 @@ files already in the repo:
 CORS is already wide open (`allow_origins=["*"]`) in `main.py` specifically
 so the frontend can live on a different domain than the API.
 
-## 3. How each API works
+## 4. How each API works
 
 ### `POST /transaction`
 Records a point-earning event for a user.
@@ -102,7 +166,7 @@ Request body:
 - `idempotency_key`: client-supplied string (1–128 chars) that uniquely
   identifies *this* transaction attempt. The client should generate one
   per logical transaction and reuse the same key on retries (timeouts,
-  network errors) — see §5.
+  network errors) — see §6.
 
 Responses:
 - `201 Created`, `{"duplicate": false, ...}` — first time this key was seen.
@@ -110,7 +174,7 @@ Responses:
   original transaction's data is returned unchanged. Not an error, not a
   re-processing.
 - `422 Unprocessable Entity` — validation failure, body explains which field.
-- `429 Too Many Requests` — that user exceeded the rate limit (see §5).
+- `429 Too Many Requests` — that user exceeded the rate limit (see §6).
 
 ### `GET /summary/:userId`
 ```json
@@ -124,7 +188,7 @@ Responses:
 }
 ```
 - `total_points`: raw sum of all of that user's transaction amounts.
-- `ranking_points`: the score actually used for the leaderboard (see §4) —
+- `ranking_points`: the score actually used for the leaderboard (see §5) —
   not the same as `total_points` by design.
 - `404 Not Found` if the user has no transactions yet (no implicit
   zero-record creation; a user only exists once they've transacted).
@@ -140,7 +204,7 @@ by `total_points`, then `user_id` for determinism). Supports
 ]
 ```
 
-## 4. How ranking is calculated
+## 5. How ranking is calculated
 
 A pure sum of points is easy to game — one oversized or scripted
 transaction can take #1 with zero sustained engagement. So the score
@@ -170,7 +234,7 @@ is an amount of points a user earned. The same formula structure (raw value
 + consistency, with a per-event cap) generalizes to other domains (sales,
 trades, contributions) by swapping what "amount" represents.
 
-## 5. How duplicate requests and abuse are prevented
+## 6. How duplicate requests and abuse are prevented
 
 **Duplicate processing (idempotency):**
 - Every `POST /transaction` requires a caller-supplied `idempotency_key`.
@@ -202,7 +266,7 @@ trades, contributions) by swapping what "amount" represents.
 - **Rate limiting** — max 10 transactions per user per 60-second sliding
   window (`rate_limiter.py`), independent of idempotency keys, so a script
   spamming *distinct* keys still gets capped at `429`.
-- **Per-transaction ranking cap** — see §4; stops one inflated transaction
+- **Per-transaction ranking cap** — see §5; stops one inflated transaction
   from buying the top rank.
 - **Strict input validation** — `user_id` and `idempotency_key` are
   restricted to a safe character set (alphanumeric + a few separators),
@@ -211,7 +275,7 @@ trades, contributions) by swapping what "amount" represents.
   NaN/Infinity are explicitly rejected since they pass Python's `float()`
   but would corrupt the running totals.
 
-## 6. Assumptions & trade-offs
+## 7. Assumptions & trade-offs
 
 - **Storage**: SQLite (file-based, WAL mode) rather than a hosted database.
   Chosen for zero external setup while still giving real ACID transactions
