@@ -8,3 +8,4 @@ backend/.pytest_cache/
 backend/server.log
 .DS_Store
 frontend/frontend.log
+VIDEO_SCRIPT.md
