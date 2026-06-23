@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: ranking-service-api
+    env: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: RANKING_DB_PATH
+        value: /app/data.db
